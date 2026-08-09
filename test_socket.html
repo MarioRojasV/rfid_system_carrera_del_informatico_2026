@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Live results test</title>
+  </head>
+  <body>
+    <h1>Live results</h1>
+    <ul id="results"></ul>
+
+    <script>
+      const socket = new WebSocket("ws://localhost:8000/ws/live");
+
+      socket.onopen = () => {
+        console.log("Connected to live results socket");
+      };
+
+      socket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        const li = document.createElement("li");
+        li.textContent = `${data.name} (${data.runner_id}) - ${data.elapsed_display}`;
+        document.getElementById("results").prepend(li);
+      };
+
+      socket.onerror = (error) => {
+        console.error("Socket error:", error);
+      };
+
+      socket.onclose = () => {
+        console.log("Socket closed");
+      };
+    </script>
+  </body>
+</html>

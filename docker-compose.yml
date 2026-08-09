@@ -1,0 +1,51 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: carrera-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  redis:
+    image: redis:7-alpine
+    container_name: carrera-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  server:
+    build: ./server
+    container_name: carrera-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      MONGO_DB_NAME: carrera_informatico_2026
+      REDIS_URL: redis://redis:6379
+      PYTHONUNBUFFERED: 1
+    depends_on:
+      - mongo
+      - redis
+
+  worker:
+    build: ./server
+    container_name: carrera-worker
+    restart: unless-stopped
+    command: python worker.py
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      MONGO_DB_NAME: carrera_informatico_2026
+      REDIS_URL: redis://redis:6379
+      PYTHONUNBUFFERED: 1
+    depends_on:
+      - mongo
+      - redis
+
+volumes:
+  mongo_data:
+  redis_data:
