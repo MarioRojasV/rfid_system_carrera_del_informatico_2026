@@ -1,10 +1,12 @@
 services:
   mongo:
-    image: mongo:7
+    # Pinned to 4.4: mongo 5+ requires a CPU with AVX support, which some
+    # deployment targets (e.g. older Synology/Atom NAS boxes) don't have.
+    image: mongo:4.4
     container_name: carrera-mongo
     restart: unless-stopped
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     volumes:
       - mongo_data:/data/db
 
@@ -13,7 +15,9 @@ services:
     container_name: carrera-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      # Host port moved to 6380: some hosts already run a native redis-server
+      # on 6379, which would otherwise collide with this container's mapping.
+      - "127.0.0.1:6380:6379"
     volumes:
       - redis_data:/data
 
