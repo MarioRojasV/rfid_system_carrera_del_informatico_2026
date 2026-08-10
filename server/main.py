@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import asyncio
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import json
 from dotenv import load_dotenv
@@ -82,6 +82,20 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+
+
+def compute_elapsed(start_time: Optional[datetime], finish_timestamp: datetime):
+    """Mirrors the elapsed time calculation done by worker.py when a result
+    is first recorded, so corrections stay consistent with normal processing."""
+    if start_time is None:
+        return None, None
+
+    if start_time.tzinfo is not None:
+        start_time = start_time.replace(tzinfo=None)
+
+    elapsed_seconds = (finish_timestamp - start_time).total_seconds()
+    elapsed_display = str(timedelta(seconds=int(elapsed_seconds)))
+    return elapsed_seconds, elapsed_display
 
 
 @app.get("/health")
@@ -287,3 +301,57 @@ async def update_runner(runner_id: str, runner: Runner, request: Request):
         {"$set": runner.model_dump()},
     )
     return {"status": "ok", "runner_id": runner.runner_id}
+
+
+class ResultTimeUpdate(BaseModel):
+    timestamp: datetime
+
+
+@app.put("/results/{runner_id}/time")
+async def update_result_time(runner_id: str, update: ResultTimeUpdate, request: Request):
+    """Corrects the finish time of a runner that already has a recorded
+    result (e.g. a wrong manual entry or a bad RFID read). Recomputes the
+    elapsed time from the category's start time and re-broadcasts the
+    result so every connected client (admin panel, public client) picks up
+    the correction live, the same way a fresh finish would."""
+
+    existing = await request.app.mongodb["results"].find_one({"runner_id": runner_id})
+    if existing is None:
+        return {
+            "status": "error",
+            "message": f"No hay un resultado registrado para el corredor {runner_id}",
+        }
+
+    finish_timestamp = update.timestamp
+    if finish_timestamp.tzinfo is not None:
+        finish_timestamp = finish_timestamp.replace(tzinfo=None)
+
+    race_config = await request.app.mongodb["race_config"].find_one(
+        {"category": existing["category"]}
+    )
+    start_time = race_config["start_time"] if race_config is not None else None
+    elapsed_seconds, elapsed_display = compute_elapsed(start_time, finish_timestamp)
+
+    update_fields = {
+        "timestamp": finish_timestamp,
+        "elapsed_seconds": elapsed_seconds,
+        "elapsed_display": elapsed_display,
+        "corrected": True,
+        "corrected_at": datetime.utcnow(),
+    }
+
+    await request.app.mongodb["results"].update_one(
+        {"runner_id": runner_id},
+        {"$set": update_fields},
+    )
+
+    updated_doc = {**existing, **update_fields}
+    updated_doc["_id"] = str(existing["_id"])
+
+    # Same channel/shape used by worker.py so existing listeners (websocket
+    # clients merging by runner_id) pick up the correction without changes.
+    await request.app.redis_client.publish(
+        "live_results", json.dumps(updated_doc, default=str)
+    )
+
+    return {"status": "ok", "result": updated_doc}
