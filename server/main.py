@@ -18,15 +18,32 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
 REDIS_URL = os.getenv("REDIS_URL")
 
 
+RESULTS_CHANNEL = "live_results"  # worker.py finishes + time corrections
+RUNNERS_CHANNEL = "runner_updates"  # runner created/edited (no time involved)
+
+
 async def listen_to_live_results():
     listener_redis = redis.from_url(REDIS_URL, decode_responses=True)
     pubsub = listener_redis.pubsub()
-    await pubsub.subscribe("live_results")
-    print("Subscribed to live_results channel")
+    await pubsub.subscribe(RESULTS_CHANNEL, RUNNERS_CHANNEL)
+    print(f"Subscribed to {RESULTS_CHANNEL} and {RUNNERS_CHANNEL} channels")
 
     async for message in pubsub.listen():
-        if message["type"] == "message":
-            await manager.broadcast(message["data"])
+        if message["type"] != "message":
+            continue
+
+        # Tag each broadcast with where it came from so clients can tell a
+        # "runner created/edited" update apart from an actual finish time —
+        # the assistant app in particular treats every message as "this
+        # runner just finished" and must not confuse the two.
+        try:
+            payload = json.loads(message["data"])
+        except (TypeError, ValueError):
+            continue
+        payload.setdefault(
+            "type", "result" if message["channel"] == RESULTS_CHANNEL else "runner"
+        )
+        await manager.broadcast(json.dumps(payload, default=str))
 
 
 @asynccontextmanager
@@ -194,6 +211,15 @@ class Runner(BaseModel):
     subcategory: str
 
 
+async def publish_runner_update(request: Request, runner: Runner):
+    """Broadcasts a runner creation/edit over the websocket. Deliberately
+    carries no timestamp field at all (not even null) so clients that merge
+    by runner_id don't clobber a finish time already recorded for them."""
+    await request.app.redis_client.publish(
+        RUNNERS_CHANNEL, json.dumps(runner.model_dump(), default=str)
+    )
+
+
 @app.post("/runners")
 async def create_runner(runner: Runner, request: Request):
     existing = await request.app.mongodb["runners"].find_one(
@@ -213,6 +239,7 @@ async def create_runner(runner: Runner, request: Request):
             }
 
     await request.app.mongodb["runners"].insert_one(runner.model_dump())
+    await publish_runner_update(request, runner)
     return {"status": "ok", "runner_id": runner.runner_id}
 
 
@@ -251,6 +278,7 @@ async def create_runners_bulk(runners: list[Runner], request: Request):
                 continue
 
         await request.app.mongodb["runners"].insert_one(runner.model_dump())
+        await publish_runner_update(request, runner)
         seen_runner_ids.add(runner.runner_id)
         if runner.tag_id is not None:
             seen_tag_ids.add(runner.tag_id)
@@ -300,6 +328,7 @@ async def update_runner(runner_id: str, runner: Runner, request: Request):
         {"runner_id": runner_id},
         {"$set": runner.model_dump()},
     )
+    await publish_runner_update(request, runner)
     return {"status": "ok", "runner_id": runner.runner_id}
 
 
@@ -351,7 +380,7 @@ async def update_result_time(runner_id: str, update: ResultTimeUpdate, request: 
     # Same channel/shape used by worker.py so existing listeners (websocket
     # clients merging by runner_id) pick up the correction without changes.
     await request.app.redis_client.publish(
-        "live_results", json.dumps(updated_doc, default=str)
+        RESULTS_CHANNEL, json.dumps(updated_doc, default=str)
     )
 
     return {"status": "ok", "result": updated_doc}
