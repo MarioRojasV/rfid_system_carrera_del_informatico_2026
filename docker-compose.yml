@@ -6,7 +6,10 @@ services:
     container_name: carrera-mongo
     restart: unless-stopped
     ports:
-      - "127.0.0.1:27017:27017"
+      # Expuesto en la red (no solo loopback) a pedido, para conectarse
+      # directo a 172.24.160.6:27017. Sin usuario/contraseña configurados:
+      # queda accesible sin autenticación a cualquiera en la red.
+      - "27017:27017"
     volumes:
       - mongo_data:/data/db
 
