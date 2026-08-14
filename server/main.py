@@ -338,22 +338,54 @@ class ResultTimeUpdate(BaseModel):
 
 @app.put("/results/{runner_id}/time")
 async def update_result_time(runner_id: str, update: ResultTimeUpdate, request: Request):
-    """Corrects the finish time of a runner that already has a recorded
-    result (e.g. a wrong manual entry or a bad RFID read). Recomputes the
-    elapsed time from the category's start time and re-broadcasts the
-    result so every connected client (admin panel, public client) picks up
-    the correction live, the same way a fresh finish would."""
-
-    existing = await request.app.mongodb["results"].find_one({"runner_id": runner_id})
-    if existing is None:
-        return {
-            "status": "error",
-            "message": f"No hay un resultado registrado para el corredor {runner_id}",
-        }
+    """Sets or corrects the finish time of a runner. If a result already
+    exists, corrects it in place (e.g. a wrong manual entry or a bad RFID
+    read). If the runner has no result yet, creates one from scratch —
+    this is what powers the admin panel's "Agregar tiempo" action for
+    still-pending runners, through this same endpoint. Either way,
+    recomputes the elapsed time from the category's start time and
+    re-broadcasts so every connected client (admin panel, public client)
+    picks up the change live, the same way a fresh finish would."""
 
     finish_timestamp = update.timestamp
     if finish_timestamp.tzinfo is not None:
         finish_timestamp = finish_timestamp.replace(tzinfo=None)
+
+    existing = await request.app.mongodb["results"].find_one({"runner_id": runner_id})
+
+    if existing is None:
+        runner = await request.app.mongodb["runners"].find_one({"runner_id": runner_id})
+        if runner is None:
+            return {
+                "status": "error",
+                "message": f"El corredor {runner_id} no existe",
+            }
+
+        race_config = await request.app.mongodb["race_config"].find_one(
+            {"category": runner["category"]}
+        )
+        start_time = race_config["start_time"] if race_config is not None else None
+        elapsed_seconds, elapsed_display = compute_elapsed(start_time, finish_timestamp)
+
+        new_doc = {
+            "runner_id": runner["runner_id"],
+            "name": runner["name"],
+            "gender": runner["gender"],
+            "category": runner["category"],
+            "subcategory": runner["subcategory"],
+            "timestamp": finish_timestamp,
+            "elapsed_seconds": elapsed_seconds,
+            "elapsed_display": elapsed_display,
+            "source": "admin",
+        }
+        insert_result = await request.app.mongodb["results"].insert_one(new_doc)
+        new_doc["_id"] = str(insert_result.inserted_id)
+
+        await request.app.redis_client.publish(
+            RESULTS_CHANNEL, json.dumps(new_doc, default=str)
+        )
+
+        return {"status": "ok", "result": new_doc}
 
     race_config = await request.app.mongodb["race_config"].find_one(
         {"category": existing["category"]}
@@ -384,3 +416,42 @@ async def update_result_time(runner_id: str, update: ResultTimeUpdate, request: 
     )
 
     return {"status": "ok", "result": updated_doc}
+
+
+@app.delete("/results/{runner_id}/time")
+async def delete_result_time(runner_id: str, request: Request):
+    """Deletes a runner's recorded finish time, reverting them to
+    pending. This removes the whole 'results' document rather than just
+    nulling its timestamp: worker.py's duplicate guard checks whether a
+    result document exists for the runner, not whether its timestamp is
+    set, so leaving a blanked-out document in place would silently
+    prevent that runner from ever being recorded again via a fresh RFID
+    scan or manual entry. Re-broadcasts on the same channel/shape as a
+    correction, with timestamp null and deleted=True, so connected
+    clients revert the runner live and the admin activity log can label
+    it correctly instead of reading it as a new finish."""
+
+    existing = await request.app.mongodb["results"].find_one({"runner_id": runner_id})
+    if existing is None:
+        return {
+            "status": "error",
+            "message": f"No hay un resultado registrado para el corredor {runner_id}",
+        }
+
+    await request.app.mongodb["results"].delete_one({"runner_id": runner_id})
+
+    payload = {
+        **existing,
+        "_id": str(existing["_id"]),
+        "timestamp": None,
+        "elapsed_seconds": None,
+        "elapsed_display": None,
+        "corrected": False,
+        "deleted": True,
+    }
+
+    await request.app.redis_client.publish(
+        RESULTS_CHANNEL, json.dumps(payload, default=str)
+    )
+
+    return {"status": "ok", "runner_id": runner_id}
