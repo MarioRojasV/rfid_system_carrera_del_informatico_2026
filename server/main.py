@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import asyncio
 from typing import Optional, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import json
 import io
@@ -23,6 +23,22 @@ REDIS_URL = os.getenv("REDIS_URL")
 
 RESULTS_CHANNEL = "live_results"  # worker.py finishes + time corrections
 RUNNERS_CHANNEL = "runner_updates"  # runner created/edited (no time involved)
+
+# Costa Rica no observa horario de verano, así que un offset fijo es
+# correcto siempre — evita depender del paquete tzdata (ausente en la
+# imagen python:3.12-slim) que necesitaría zoneinfo con un IANA tz name.
+COSTA_RICA_TZ = timezone(timedelta(hours=-6))
+
+
+def now_cr() -> datetime:
+    """Hora actual en Costa Rica (UTC-6) como datetime naive. Todo el
+    sistema guarda y compara timestamps 'naive' asumiendo que representan
+    hora de Costa Rica (ver compute_elapsed, y el mismo criterio en
+    admin/cliente) — esta es la única fuente de "ahora" del servidor, para
+    que campos como received_at/corrected_at, generados con el reloj del
+    servidor, queden en la misma zona horaria que las llegadas que recibe
+    en vez de en la hora UTC real del sistema operativo."""
+    return datetime.now(COSTA_RICA_TZ).replace(tzinfo=None)
 
 
 async def listen_to_live_results():
@@ -134,11 +150,11 @@ class RawEvent(BaseModel):
 @app.post("/events")
 async def receive_event(event: RawEvent, request: Request):
     doc = event.model_dump(mode="json")
-    doc["received_at"] = datetime.utcnow().isoformat()
+    doc["received_at"] = now_cr().isoformat()
 
     # Always store the raw event first, no matter what happens next
     await request.app.mongodb["raw_events"].insert_one(
-        {**doc, "received_at": datetime.utcnow()}
+        {**doc, "received_at": now_cr()}
     )
 
     # Push to the queue for async processing instead of processing inline
@@ -185,7 +201,7 @@ async def _process_offline_event(db, redis_client, event: OfflineEvent):
         "runner_id": event.runner_id,
         "timestamp": event.timestamp,
         "event_id": event.event_id,
-        "received_at": datetime.utcnow(),
+        "received_at": now_cr(),
     }
     await db["raw_events"].insert_one(raw_doc)
 
@@ -221,7 +237,7 @@ async def _process_offline_event(db, redis_client, event: OfflineEvent):
             "source": "offline",
             "event_id": event.event_id,
             "corrected": True,
-            "corrected_at": datetime.utcnow(),
+            "corrected_at": now_cr(),
         }
         await db["results"].update_one(
             {"runner_id": event.runner_id},
@@ -735,7 +751,7 @@ async def update_result_time(runner_id: str, update: ResultTimeUpdate, request: 
         "elapsed_seconds": elapsed_seconds,
         "elapsed_display": elapsed_display,
         "corrected": True,
-        "corrected_at": datetime.utcnow(),
+        "corrected_at": now_cr(),
     }
 
     await request.app.mongodb["results"].update_one(
