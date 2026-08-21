@@ -272,6 +272,44 @@ async def get_results(
     return {"count": len(results), "results": results}
 
 
+@app.delete("/results")
+async def delete_all_result_times(request: Request):
+    """Clears every runner's recorded finish time in one shot — the bulk
+    version of delete_result_time, used by the admin panel's 'Limpiar
+    tiempos' action (both from Corredores and from Configuración de
+    tiempos). Removes every 'results' document rather than nulling
+    timestamps, for the same reason as the single-runner delete:
+    worker.py's duplicate guard checks for document existence, not for a
+    set timestamp — leaving blanked-out documents in place would block
+    every runner from ever being recorded again. Emits one broadcast per
+    cleared runner, same shape as an individual deletion, so connected
+    clients revert them live."""
+
+    cursor = request.app.mongodb["results"].find({})
+    existing_results = await cursor.to_list(length=None)
+
+    if not existing_results:
+        return {"status": "ok", "cleared": 0}
+
+    await request.app.mongodb["results"].delete_many({})
+
+    for existing in existing_results:
+        payload = {
+            **existing,
+            "_id": str(existing["_id"]),
+            "timestamp": None,
+            "elapsed_seconds": None,
+            "elapsed_display": None,
+            "corrected": False,
+            "deleted": True,
+        }
+        await request.app.redis_client.publish(
+            RESULTS_CHANNEL, json.dumps(payload, default=str)
+        )
+
+    return {"status": "ok", "cleared": len(existing_results)}
+
+
 class RaceConfig(BaseModel):
     category: str
     start_time: datetime
