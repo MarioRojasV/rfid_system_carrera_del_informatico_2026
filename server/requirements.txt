@@ -8,10 +8,12 @@ h11==0.16.0
 httptools==0.8.0
 idna==3.18
 motor==3.7.1
+openpyxl==3.1.5
 pydantic==2.13.4
 pydantic_core==2.46.4
 pymongo==4.17.0
 python-dotenv==1.2.2
+python-multipart==0.0.20
 PyYAML==6.0.3
 redis==8.1.0
 starlette==1.6.0
