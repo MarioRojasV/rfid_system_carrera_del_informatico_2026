@@ -606,7 +606,14 @@ async def replace_runners_bulk_from_file(request: Request, file: UploadFile = Fi
     used when a fresh/corrected registration export should become the
     new source of truth (e.g. right before race day). Rows the parser
     can't map to a valid Runner are skipped and reported back, same as
-    /runners/bulk does for in-batch conflicts."""
+    /runners/bulk does for in-batch conflicts.
+
+    tag_id is the one exception to "rebuilt from the file": the
+    registration export never carries it (it's assigned by hand later,
+    via PUT /runners/{runner_id} — see TagEditButton in the admin), so a
+    runner whose runner_id matches between the old and new roster keeps
+    whatever tag_id it already had. Only runners that disappear from the
+    new file (or never had one) end up without a tag."""
 
     if not file.filename or not file.filename.lower().endswith(".xlsx"):
         return {"status": "error", "message": "El archivo debe ser un .xlsx"}
@@ -625,6 +632,16 @@ async def replace_runners_bulk_from_file(request: Request, file: UploadFile = Fi
         }
 
     db = request.app.mongodb
+
+    # Snapshot of the current runner_id -> tag_id assignments, taken before
+    # anything is deleted, so they can be reapplied to whichever runner_ids
+    # still exist in the new file.
+    existing_tag_by_runner_id = {
+        doc["runner_id"]: doc["tag_id"]
+        async for doc in db["runners"].find(
+            {"tag_id": {"$ne": None}}, {"runner_id": 1, "tag_id": 1}
+        )
+    }
 
     # Clear existing results first (same broadcast shape as
     # delete_all_result_times) so connected clients revert any live times
@@ -649,12 +666,25 @@ async def replace_runners_bulk_from_file(request: Request, file: UploadFile = Fi
     await db["runners"].delete_many({})
 
     inserted = 0
+    tags_preserved = 0
     for runner in runners:
+        preserved_tag_id = existing_tag_by_runner_id.get(runner.runner_id)
+        if preserved_tag_id is not None:
+            runner.tag_id = preserved_tag_id
+            tags_preserved += 1
         await db["runners"].insert_one(runner.model_dump())
         await publish_runner_update(request, runner)
         inserted += 1
 
-    return {"status": "ok", "inserted": inserted, "skipped": skipped}
+    tags_lost = len(existing_tag_by_runner_id) - tags_preserved
+
+    return {
+        "status": "ok",
+        "inserted": inserted,
+        "skipped": skipped,
+        "tags_preserved": tags_preserved,
+        "tags_lost": tags_lost,
+    }
 
 
 @app.get("/runners")
