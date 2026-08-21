@@ -125,6 +125,7 @@ class RawEvent(BaseModel):
     tag_id: Optional[str] = None
     runner_id: Optional[str] = None
     timestamp: datetime
+    event_id: Optional[str] = None  # UUID para idempotencia (offline sync)
 
 
 @app.post("/events")
@@ -141,6 +142,110 @@ async def receive_event(event: RawEvent, request: Request):
     await request.app.redis_client.rpush("events_queue", json.dumps(doc))
 
     return {"status": "queued"}
+
+
+class OfflineEvent(BaseModel):
+    event_id: str
+    runner_id: str
+    timestamp: datetime
+
+
+class OfflineSyncRequest(BaseModel):
+    events: list[OfflineEvent]
+
+
+@app.post("/events/sync")
+async def sync_offline_events(request_body: OfflineSyncRequest, request: Request):
+    """Processes offline events synchronously, one by one. Returns the
+    status of each event so the client knows which were accepted,
+    duplicated, or rejected due to conflicts."""
+    db = request.app.mongodb
+    results = []
+
+    for event in request_body.events:
+        result = await _process_offline_event(db, request.app.redis_client, event)
+        results.append(result)
+
+    return {"status": "ok", "results": results}
+
+
+async def _process_offline_event(db, redis_client, event: OfflineEvent):
+    """Processes a single offline event. Returns a status dict."""
+    # 1. Check for duplicate event_id in results
+    existing_result = await db["results"].find_one({"event_id": event.event_id})
+    if existing_result is not None:
+        return {"event_id": event.event_id, "status": "duplicate", "message": "Evento ya procesado"}
+
+    # 2. Store raw event
+    raw_doc = {
+        "source": "offline",
+        "runner_id": event.runner_id,
+        "timestamp": event.timestamp,
+        "event_id": event.event_id,
+        "received_at": datetime.utcnow(),
+    }
+    await db["raw_events"].insert_one(raw_doc)
+
+    # 3. Look up runner
+    runner = await db["runners"].find_one({"runner_id": event.runner_id})
+    if runner is None:
+        return {"event_id": event.event_id, "status": "error", "message": f"Corredor {event.runner_id} no encontrado"}
+
+    # 4. Check if runner already has a result
+    existing = await db["results"].find_one({"runner_id": event.runner_id})
+    finish_timestamp = event.timestamp
+    if finish_timestamp.tzinfo is not None:
+        finish_timestamp = finish_timestamp.replace(tzinfo=None)
+
+    race_config = await db["race_config"].find_one({"category": runner["category"]})
+    start_time = race_config["start_time"] if race_config is not None else None
+    elapsed_seconds, elapsed_display = compute_elapsed(start_time, finish_timestamp)
+
+    if existing is not None:
+        # Conflict resolution: earlier finish time wins
+        existing_ts = existing["timestamp"]
+        if existing_ts is not None and finish_timestamp >= existing_ts:
+            return {
+                "event_id": event.event_id,
+                "status": "conflict",
+                "message": f"El corredor {event.runner_id} ya tiene un tiempo registrado con prioridad",
+            }
+        # Incoming event is earlier — replace existing result
+        update_fields = {
+            "timestamp": finish_timestamp,
+            "elapsed_seconds": elapsed_seconds,
+            "elapsed_display": elapsed_display,
+            "source": "offline",
+            "event_id": event.event_id,
+            "corrected": True,
+            "corrected_at": datetime.utcnow(),
+        }
+        await db["results"].update_one(
+            {"runner_id": event.runner_id},
+            {"$set": update_fields},
+        )
+        updated_doc = {**existing, **update_fields}
+        updated_doc["_id"] = str(existing["_id"])
+        await redis_client.publish(RESULTS_CHANNEL, json.dumps(updated_doc, default=str))
+        return {"event_id": event.event_id, "status": "accepted"}
+
+    # 5. No existing result — create new
+    result_doc = {
+        "runner_id": runner["runner_id"],
+        "name": runner["name"],
+        "gender": runner["gender"],
+        "category": runner["category"],
+        "subcategory": runner["subcategory"],
+        "timestamp": finish_timestamp,
+        "elapsed_seconds": elapsed_seconds,
+        "elapsed_display": elapsed_display,
+        "source": "offline",
+        "event_id": event.event_id,
+    }
+    insert_result = await db["results"].insert_one(result_doc)
+    result_doc["_id"] = str(insert_result.inserted_id)
+    await redis_client.publish(RESULTS_CHANNEL, json.dumps(result_doc, default=str))
+    return {"event_id": event.event_id, "status": "accepted"}
 
 
 @app.get("/results")

@@ -33,6 +33,14 @@ async def process_event(db, event: dict, redis_client):
 
     resolved_runner_id = runner["runner_id"]
 
+    # Idempotency check: skip if this event_id was already processed
+    event_id = event.get("event_id")
+    if event_id:
+        already_processed = await db["results"].find_one({"event_id": event_id})
+        if already_processed:
+            print(f"Duplicate event_id ignored: {event_id}")
+            return
+
     existing = await db["results"].find_one({"runner_id": resolved_runner_id})
     if existing is not None:
         print(f"Duplicate ignored for runner {resolved_runner_id}")
@@ -64,6 +72,7 @@ async def process_event(db, event: dict, redis_client):
         "elapsed_seconds": elapsed_seconds,
         "elapsed_display": elapsed_display,
         "source": event["source"],
+        "event_id": event_id,
     }
     try:
         await db["results"].insert_one(result_doc)
