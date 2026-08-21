@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import redis.asyncio as redis
@@ -9,6 +9,9 @@ from typing import Optional, List
 from datetime import datetime, timedelta, timezone
 import os
 import json
+import io
+import unicodedata
+import openpyxl
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -441,6 +444,213 @@ async def create_runners_bulk(runners: list[Runner], request: Request):
         seen_runner_ids.add(runner.runner_id)
         if runner.tag_id is not None:
             seen_tag_ids.add(runner.tag_id)
+        inserted += 1
+
+    return {"status": "ok", "inserted": inserted, "skipped": skipped}
+
+
+def _strip_accents(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    return "".join(c for c in normalized if not unicodedata.combining(c))
+
+
+def _normalize_text(value) -> str:
+    return _strip_accents(str(value or "").strip().lower())
+
+
+def _normalize_header(value) -> str:
+    return _normalize_text(value)
+
+
+# "Distancia" del formulario -> category del modelo Runner.
+_CATEGORY_BY_DISTANCE = {
+    "10km": "10K",
+    "10 km": "10K",
+    "5km": "5K",
+    "5 km": "5K",
+}
+
+# "Categoria" (franja etaria) del formulario -> subcategory del modelo Runner.
+_SUBCATEGORY_BY_LABEL = {
+    "mayor": "mayor",
+    "veterano": "veterano",
+    "master": "master",
+    "informatico": "informatico",
+}
+
+_GENDER_MAP = {
+    "femenino": "F",
+    "masculino": "M",
+}
+
+
+def _match_by_prefix(normalized_value: str, mapping: dict) -> Optional[str]:
+    for key, mapped in mapping.items():
+        if normalized_value.startswith(key):
+            return mapped
+    return None
+
+
+def parse_runners_xlsx(file_bytes: bytes):
+    """Parses the runner registration spreadsheet (Google Forms export)
+    into a list of valid Runner objects plus a list of skipped rows with
+    the reason each was skipped. Only the first sheet is read — extra
+    sheets in the workbook (e.g. unrelated finance notes) are ignored.
+    Rows are matched by header name rather than column position, since
+    the form export carries several columns (email, cédula, teléfono,
+    etc.) that aren't needed to build a Runner."""
+
+    workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    sheet = workbook.worksheets[0]
+    rows = sheet.iter_rows(values_only=True)
+
+    header = next(rows, None)
+    if header is None:
+        return [], []
+
+    column_index = {}
+    for i, cell in enumerate(header):
+        if cell is None:
+            continue
+        column_index[_normalize_header(cell)] = i
+
+    required_headers = ["numero", "nombre", "apellidos", "genero", "distancia"]
+    missing = [h for h in required_headers if h not in column_index]
+    if missing:
+        raise ValueError(f"Faltan columnas requeridas en el archivo: {', '.join(missing)}")
+
+    def cell(row, header_name):
+        idx = column_index.get(header_name)
+        if idx is None or idx >= len(row):
+            return None
+        return row[idx]
+
+    runners = []
+    skipped = []
+    seen_runner_ids = set()
+
+    for row_number, row in enumerate(rows, start=2):
+        if row is None or all(v is None for v in row):
+            continue
+
+        numero = cell(row, "numero")
+        if numero is None or str(numero).strip() == "":
+            skipped.append({"row": row_number, "reason": "Falta el número de inscripción"})
+            continue
+
+        if isinstance(numero, (int, float)) and not isinstance(numero, bool):
+            if isinstance(numero, float) and not numero.is_integer():
+                skipped.append({"row": row_number, "reason": f"Número de inscripción no es numérico: {numero!r}"})
+                continue
+            runner_id = str(int(numero))
+        else:
+            numero_str = str(numero).strip()
+            if not numero_str.isdigit():
+                skipped.append({"row": row_number, "reason": f"Número de inscripción no es numérico: {numero!r}"})
+                continue
+            runner_id = numero_str
+
+        if runner_id in seen_runner_ids:
+            skipped.append({"row": row_number, "runner_id": runner_id, "reason": "runner_id duplicado en el archivo"})
+            continue
+
+        nombre = str(cell(row, "nombre") or "").strip()
+        apellidos = str(cell(row, "apellidos") or "").strip()
+        name = f"{nombre} {apellidos}".strip()
+        if not name:
+            skipped.append({"row": row_number, "runner_id": runner_id, "reason": "Falta el nombre"})
+            continue
+
+        gender = _GENDER_MAP.get(_normalize_text(cell(row, "genero")))
+        if gender is None:
+            skipped.append({"row": row_number, "runner_id": runner_id, "reason": f"Género no reconocido: {cell(row, 'genero')!r}"})
+            continue
+
+        category = _match_by_prefix(_normalize_text(cell(row, "distancia")), _CATEGORY_BY_DISTANCE)
+        if category is None:
+            skipped.append({"row": row_number, "runner_id": runner_id, "reason": f"Distancia no reconocida: {cell(row, 'distancia')!r}"})
+            continue
+
+        subcategory = _match_by_prefix(_normalize_text(cell(row, "categoria")), _SUBCATEGORY_BY_LABEL)
+        if subcategory is None:
+            # subcategory solo importa para el podio del 10K (ver
+            # category.js en el admin) — un 5K sin franja etaria
+            # reconocible igual es un corredor válido, se acepta sin ella.
+            if category != "5K":
+                skipped.append({"row": row_number, "runner_id": runner_id, "reason": f"Categoría no reconocida: {cell(row, 'categoria')!r}"})
+                continue
+            subcategory = ""
+
+        runners.append(
+            Runner(
+                runner_id=runner_id,
+                tag_id=None,
+                name=name,
+                gender=gender,
+                category=category,
+                subcategory=subcategory,
+            )
+        )
+        seen_runner_ids.add(runner_id)
+
+    return runners, skipped
+
+
+@app.post("/runners/bulk/replace-from-file")
+async def replace_runners_bulk_from_file(request: Request, file: UploadFile = File(...)):
+    """Replaces the ENTIRE runner roster from an uploaded .xlsx (the
+    registration form export). Unlike /runners/bulk, which only adds
+    runners and skips ones that already exist, this drops every current
+    runner and every recorded result and rebuilds both from the file —
+    used when a fresh/corrected registration export should become the
+    new source of truth (e.g. right before race day). Rows the parser
+    can't map to a valid Runner are skipped and reported back, same as
+    /runners/bulk does for in-batch conflicts."""
+
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+        return {"status": "error", "message": "El archivo debe ser un .xlsx"}
+
+    contents = await file.read()
+    try:
+        runners, skipped = parse_runners_xlsx(contents)
+    except Exception as exc:
+        return {"status": "error", "message": f"No se pudo leer el archivo: {exc}"}
+
+    if not runners:
+        return {
+            "status": "error",
+            "message": "El archivo no contiene corredores válidos",
+            "skipped": skipped,
+        }
+
+    db = request.app.mongodb
+
+    # Clear existing results first (same broadcast shape as
+    # delete_all_result_times) so connected clients revert any live times
+    # before the runner list itself changes underneath them.
+    existing_results = await db["results"].find({}).to_list(length=None)
+    if existing_results:
+        await db["results"].delete_many({})
+        for existing in existing_results:
+            payload = {
+                **existing,
+                "_id": str(existing["_id"]),
+                "timestamp": None,
+                "elapsed_seconds": None,
+                "elapsed_display": None,
+                "corrected": False,
+                "deleted": True,
+            }
+            await request.app.redis_client.publish(
+                RESULTS_CHANNEL, json.dumps(payload, default=str)
+            )
+
+    await db["runners"].delete_many({})
+
+    inserted = 0
+    for runner in runners:
+        await db["runners"].insert_one(runner.model_dump())
+        await publish_runner_update(request, runner)
         inserted += 1
 
     return {"status": "ok", "inserted": inserted, "skipped": skipped}
