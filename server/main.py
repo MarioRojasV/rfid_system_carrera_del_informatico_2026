@@ -538,7 +538,18 @@ def parse_runners_xlsx(file_bytes: bytes):
             skipped.append({"row": row_number, "reason": "Falta el número de inscripción"})
             continue
 
-        runner_id = str(int(numero)) if isinstance(numero, float) and numero.is_integer() else str(numero).strip()
+        if isinstance(numero, (int, float)) and not isinstance(numero, bool):
+            if isinstance(numero, float) and not numero.is_integer():
+                skipped.append({"row": row_number, "reason": f"Número de inscripción no es numérico: {numero!r}"})
+                continue
+            runner_id = str(int(numero))
+        else:
+            numero_str = str(numero).strip()
+            if not numero_str.isdigit():
+                skipped.append({"row": row_number, "reason": f"Número de inscripción no es numérico: {numero!r}"})
+                continue
+            runner_id = numero_str
+
         if runner_id in seen_runner_ids:
             skipped.append({"row": row_number, "runner_id": runner_id, "reason": "runner_id duplicado en el archivo"})
             continue
@@ -562,8 +573,13 @@ def parse_runners_xlsx(file_bytes: bytes):
 
         subcategory = _match_by_prefix(_normalize_text(cell(row, "categoria")), _SUBCATEGORY_BY_LABEL)
         if subcategory is None:
-            skipped.append({"row": row_number, "runner_id": runner_id, "reason": f"Categoría no reconocida: {cell(row, 'categoria')!r}"})
-            continue
+            # subcategory solo importa para el podio del 10K (ver
+            # category.js en el admin) — un 5K sin franja etaria
+            # reconocible igual es un corredor válido, se acepta sin ella.
+            if category != "5K":
+                skipped.append({"row": row_number, "runner_id": runner_id, "reason": f"Categoría no reconocida: {cell(row, 'categoria')!r}"})
+                continue
+            subcategory = ""
 
         runners.append(
             Runner(
