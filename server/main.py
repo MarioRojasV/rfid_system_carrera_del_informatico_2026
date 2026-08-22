@@ -379,6 +379,16 @@ class Runner(BaseModel):
     gender: str
     category: str
     subcategory: str
+    # shirt_size sí viene del export de inscripción (ver
+    # parse_runners_xlsx), igual que name/gender/category: se reescribe
+    # en cada reemplazo por .xlsx, no se preserva.
+    shirt_size: Optional[str] = None
+    # Datos permanentes asignados a mano desde el admin (ver
+    # RunnerInfoButton): el export de inscripción nunca los trae, así
+    # que sobreviven a un reemplazo por .xlsx (ver
+    # replace_runners_bulk_from_file) en vez de reescribirse.
+    shirt_delivered: bool = False
+    kit_delivered: bool = False
 
 
 async def publish_runner_update(request: Request, runner: Runner):
@@ -533,6 +543,12 @@ def parse_runners_xlsx(file_bytes: bytes):
             return None
         return row[idx]
 
+    # La columna de talla no tiene un nombre fijo en el formulario (p. ej.
+    # "Talla" o "Talla de camiseta"), y a diferencia de los headers de
+    # arriba, es opcional: si no está, shirt_size simplemente queda vacío
+    # en vez de descartar la fila.
+    talla_header = next((h for h in column_index if "talla" in h), None)
+
     runners = []
     skipped = []
     seen_runner_ids = set()
@@ -590,10 +606,14 @@ def parse_runners_xlsx(file_bytes: bytes):
                 skipped.append({"row": row_number, "runner_id": runner_id, "reason": f"Categoría no reconocida: {cell(row, 'categoria')!r}"})
                 continue
 
+        talla_raw = cell(row, talla_header) if talla_header else None
+        shirt_size = str(talla_raw).strip().upper() if talla_raw not in (None, "") else None
+
         runners.append(
             Runner(
                 runner_id=runner_id,
                 tag_id=None,
+                shirt_size=shirt_size,
                 name=name,
                 gender=gender,
                 category=category,
@@ -616,12 +636,15 @@ async def replace_runners_bulk_from_file(request: Request, file: UploadFile = Fi
     can't map to a valid Runner are skipped and reported back, same as
     /runners/bulk does for in-batch conflicts.
 
-    tag_id is the one exception to "rebuilt from the file": the
-    registration export never carries it (it's assigned by hand later,
-    via PUT /runners/{runner_id} — see TagEditButton in the admin), so a
-    runner whose runner_id matches between the old and new roster keeps
-    whatever tag_id it already had. Only runners that disappear from the
-    new file (or never had one) end up without a tag."""
+    tag_id, shirt_delivered and kit_delivered are the exception to
+    "rebuilt from the file": the registration export never carries them
+    (they're assigned by hand later, via PUT /runners/{runner_id} — see
+    TagEditButton and RunnerInfoButton in the admin), so a runner whose
+    runner_id matches between the old and new roster keeps whatever
+    values it already had. Only runners that disappear from the new
+    file (or never had a tag) end up without one. shirt_size, unlike
+    those, DOES come from the file (see parse_runners_xlsx) and is
+    always taken from the new upload, same as name/gender/category."""
 
     if not file.filename or not file.filename.lower().endswith(".xlsx"):
         return {"status": "error", "message": "El archivo debe ser un .xlsx"}
@@ -641,13 +664,20 @@ async def replace_runners_bulk_from_file(request: Request, file: UploadFile = Fi
 
     db = request.app.mongodb
 
-    # Snapshot of the current runner_id -> tag_id assignments, taken before
-    # anything is deleted, so they can be reapplied to whichever runner_ids
-    # still exist in the new file.
-    existing_tag_by_runner_id = {
-        doc["runner_id"]: doc["tag_id"]
+    # Snapshot of the current permanent fields (tag_id, shirt_delivered,
+    # kit_delivered — NOT shirt_size, which comes from the file itself),
+    # taken before anything is deleted, so they can be reapplied to
+    # whichever runner_ids still exist in the new file.
+    existing_permanent_by_runner_id = {
+        doc["runner_id"]: doc
         async for doc in db["runners"].find(
-            {"tag_id": {"$ne": None}}, {"runner_id": 1, "tag_id": 1}
+            {},
+            {
+                "runner_id": 1,
+                "tag_id": 1,
+                "shirt_delivered": 1,
+                "kit_delivered": 1,
+            },
         )
     }
 
@@ -679,15 +709,22 @@ async def replace_runners_bulk_from_file(request: Request, file: UploadFile = Fi
     inserted = 0
     tags_preserved = 0
     for runner in runners:
-        preserved_tag_id = existing_tag_by_runner_id.get(runner.runner_id)
-        if preserved_tag_id is not None:
-            runner.tag_id = preserved_tag_id
-            tags_preserved += 1
+        preserved = existing_permanent_by_runner_id.get(runner.runner_id)
+        if preserved is not None:
+            if preserved.get("tag_id") is not None:
+                runner.tag_id = preserved["tag_id"]
+                tags_preserved += 1
+            runner.shirt_delivered = preserved.get("shirt_delivered", False)
+            runner.kit_delivered = preserved.get("kit_delivered", False)
         await db["runners"].insert_one(runner.model_dump())
         await publish_runner_update(request, runner)
         inserted += 1
 
-    tags_lost = len(existing_tag_by_runner_id) - tags_preserved
+    tags_lost = sum(
+        1
+        for doc in existing_permanent_by_runner_id.values()
+        if doc.get("tag_id") is not None
+    ) - tags_preserved
 
     return {
         "status": "ok",
