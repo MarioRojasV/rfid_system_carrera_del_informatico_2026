@@ -557,42 +557,55 @@ def parse_runners_xlsx(file_bytes: bytes):
         if row is None or all(v is None for v in row):
             continue
 
+        # nombre/apellidos se leen primero y de una — incluso cuando el
+        # problema de la fila es OTRO campo (número de inscripción,
+        # género, etc.) — para que cada fila omitida se pueda identificar
+        # por nombre en vez de solo por número de fila del archivo.
+        nombre = str(cell(row, "nombre") or "").strip()
+        apellidos = str(cell(row, "apellidos") or "").strip()
+        name = f"{nombre} {apellidos}".strip()
+
+        def skip(reason, runner_id=None):
+            entry = {"row": row_number, "reason": reason}
+            if runner_id is not None:
+                entry["runner_id"] = runner_id
+            if name:
+                entry["name"] = name
+            skipped.append(entry)
+
         numero = cell(row, "numero")
         if numero is None or str(numero).strip() == "":
-            skipped.append({"row": row_number, "reason": "Falta el número de inscripción"})
+            skip("Falta el número de inscripción")
             continue
 
         if isinstance(numero, (int, float)) and not isinstance(numero, bool):
             if isinstance(numero, float) and not numero.is_integer():
-                skipped.append({"row": row_number, "reason": f"Número de inscripción no es numérico: {numero!r}"})
+                skip(f"Número de inscripción no es numérico: {numero!r}")
                 continue
             runner_id = str(int(numero))
         else:
             numero_str = str(numero).strip()
             if not numero_str.isdigit():
-                skipped.append({"row": row_number, "reason": f"Número de inscripción no es numérico: {numero!r}"})
+                skip(f"Número de inscripción no es numérico: {numero!r}")
                 continue
             runner_id = numero_str
 
         if runner_id in seen_runner_ids:
-            skipped.append({"row": row_number, "runner_id": runner_id, "reason": "runner_id duplicado en el archivo"})
+            skip("runner_id duplicado en el archivo", runner_id)
             continue
 
-        nombre = str(cell(row, "nombre") or "").strip()
-        apellidos = str(cell(row, "apellidos") or "").strip()
-        name = f"{nombre} {apellidos}".strip()
         if not name:
-            skipped.append({"row": row_number, "runner_id": runner_id, "reason": "Falta el nombre"})
+            skip("Falta el nombre", runner_id)
             continue
 
         gender = _GENDER_MAP.get(_normalize_text(cell(row, "genero")))
         if gender is None:
-            skipped.append({"row": row_number, "runner_id": runner_id, "reason": f"Género no reconocido: {cell(row, 'genero')!r}"})
+            skip(f"Género no reconocido: {cell(row, 'genero')!r}", runner_id)
             continue
 
         category = _match_by_prefix(_normalize_text(cell(row, "distancia")), _CATEGORY_BY_DISTANCE)
         if category is None:
-            skipped.append({"row": row_number, "runner_id": runner_id, "reason": f"Distancia no reconocida: {cell(row, 'distancia')!r}"})
+            skip(f"Distancia no reconocida: {cell(row, 'distancia')!r}", runner_id)
             continue
 
         # subcategory (franja etaria) solo importa para el podio del 10K
@@ -603,7 +616,7 @@ def parse_runners_xlsx(file_bytes: bytes):
         else:
             subcategory = _match_by_prefix(_normalize_text(cell(row, "categoria")), _SUBCATEGORY_BY_LABEL)
             if subcategory is None:
-                skipped.append({"row": row_number, "runner_id": runner_id, "reason": f"Categoría no reconocida: {cell(row, 'categoria')!r}"})
+                skip(f"Categoría no reconocida: {cell(row, 'categoria')!r}", runner_id)
                 continue
 
         talla_raw = cell(row, talla_header) if talla_header else None
