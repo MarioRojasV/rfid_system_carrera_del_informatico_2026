@@ -302,10 +302,18 @@ async def delete_all_result_times(request: Request):
     set timestamp — leaving blanked-out documents in place would block
     every runner from ever being recorded again. Emits one broadcast per
     cleared runner, same shape as an individual deletion, so connected
-    clients revert them live."""
+    clients revert them live.
+
+    Also wipes 'raw_events', the log of every RFID/manual read ever
+    received (see receive_event). It has no bearing on live results by
+    itself, but it's tied to the same runner-timing data being reset, so
+    it rides along on this same action instead of needing a separate
+    control."""
 
     cursor = request.app.mongodb["results"].find({})
     existing_results = await cursor.to_list(length=None)
+
+    await request.app.mongodb["raw_events"].delete_many({})
 
     if not existing_results:
         return {"status": "ok", "cleared": 0}
@@ -645,7 +653,10 @@ async def replace_runners_bulk_from_file(request: Request, file: UploadFile = Fi
 
     # Clear existing results first (same broadcast shape as
     # delete_all_result_times) so connected clients revert any live times
-    # before the runner list itself changes underneath them.
+    # before the runner list itself changes underneath them. Also wipes
+    # raw_events, same as delete_all_result_times, since a fresh roster
+    # makes the old RFID/manual read log stale too.
+    await db["raw_events"].delete_many({})
     existing_results = await db["results"].find({}).to_list(length=None)
     if existing_results:
         await db["results"].delete_many({})

@@ -38,6 +38,9 @@ services:
     depends_on:
       - mongo
       - redis
+    networks:
+      - default
+      - rfid-net
 
   worker:
     build: ./server
@@ -56,3 +59,13 @@ services:
 volumes:
   mongo_data:
   redis_data:
+
+networks:
+  # Red compartida con el stack de cliente-administrador-RFID: le permite a
+  # Nginx, en cada uno de esos contenedores, hacer proxy_pass hacia este
+  # backend por su container_name ("carrera-server") sin depender de
+  # ninguna IP de LAN o Tailscale. Se crea una sola vez con
+  # `docker network create rfid-net` (o la crean los deploy.sh de ambos
+  # repos si no existe).
+  rfid-net:
+    external: true
