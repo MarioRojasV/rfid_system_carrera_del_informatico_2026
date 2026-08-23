@@ -389,6 +389,9 @@ class Runner(BaseModel):
     # replace_runners_bulk_from_file) en vez de reescribirse.
     shirt_delivered: bool = False
     kit_delivered: bool = False
+    # Nota especial de texto libre (alergias, silla de ruedas, guía
+    # personal, etc.), igual de permanente que las dos anteriores.
+    special_note: Optional[str] = None
 
 
 async def publish_runner_update(request: Request, runner: Runner):
@@ -649,15 +652,16 @@ async def replace_runners_bulk_from_file(request: Request, file: UploadFile = Fi
     can't map to a valid Runner are skipped and reported back, same as
     /runners/bulk does for in-batch conflicts.
 
-    tag_id, shirt_delivered and kit_delivered are the exception to
-    "rebuilt from the file": the registration export never carries them
-    (they're assigned by hand later, via PUT /runners/{runner_id} — see
-    TagEditButton and RunnerInfoButton in the admin), so a runner whose
-    runner_id matches between the old and new roster keeps whatever
-    values it already had. Only runners that disappear from the new
-    file (or never had a tag) end up without one. shirt_size, unlike
-    those, DOES come from the file (see parse_runners_xlsx) and is
-    always taken from the new upload, same as name/gender/category."""
+    tag_id, shirt_delivered, kit_delivered and special_note are the
+    exception to "rebuilt from the file": the registration export never
+    carries them (they're assigned by hand later, via PUT
+    /runners/{runner_id} — see TagEditButton and RunnerInfoButton in the
+    admin), so a runner whose runner_id matches between the old and new
+    roster keeps whatever values it already had. Only runners that
+    disappear from the new file (or never had a tag/note) end up
+    without one. shirt_size, unlike those, DOES come from the file (see
+    parse_runners_xlsx) and is always taken from the new upload, same as
+    name/gender/category."""
 
     if not file.filename or not file.filename.lower().endswith(".xlsx"):
         return {"status": "error", "message": "El archivo debe ser un .xlsx"}
@@ -678,9 +682,9 @@ async def replace_runners_bulk_from_file(request: Request, file: UploadFile = Fi
     db = request.app.mongodb
 
     # Snapshot of the current permanent fields (tag_id, shirt_delivered,
-    # kit_delivered — NOT shirt_size, which comes from the file itself),
-    # taken before anything is deleted, so they can be reapplied to
-    # whichever runner_ids still exist in the new file.
+    # kit_delivered, special_note — NOT shirt_size, which comes from the
+    # file itself), taken before anything is deleted, so they can be
+    # reapplied to whichever runner_ids still exist in the new file.
     existing_permanent_by_runner_id = {
         doc["runner_id"]: doc
         async for doc in db["runners"].find(
@@ -690,6 +694,7 @@ async def replace_runners_bulk_from_file(request: Request, file: UploadFile = Fi
                 "tag_id": 1,
                 "shirt_delivered": 1,
                 "kit_delivered": 1,
+                "special_note": 1,
             },
         )
     }
@@ -729,6 +734,7 @@ async def replace_runners_bulk_from_file(request: Request, file: UploadFile = Fi
                 tags_preserved += 1
             runner.shirt_delivered = preserved.get("shirt_delivered", False)
             runner.kit_delivered = preserved.get("kit_delivered", False)
+            runner.special_note = preserved.get("special_note")
         await db["runners"].insert_one(runner.model_dump())
         await publish_runner_update(request, runner)
         inserted += 1
