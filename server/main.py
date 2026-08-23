@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import asyncio
 from typing import Optional, List
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import os
 import json
 import io
@@ -19,6 +19,13 @@ load_dotenv()
 MONGO_URL = os.getenv("MONGO_URL")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
 REDIS_URL = os.getenv("REDIS_URL")
+
+# Día de la carrera — se usa para calcular la edad de cada corredor a
+# partir de su fecha de nacimiento (ver _age_on y RACE_DATE en
+# parse_runners_xlsx: define quién de "Máster" pasa a "Máster B").
+# Configurable por env var para no tener que tocar código de un año a
+# otro; default al día de esta edición.
+RACE_DATE = date.fromisoformat(os.getenv("RACE_DATE", "2026-08-23"))
 
 
 RESULTS_CHANNEL = "live_results"  # worker.py finishes + time corrections
@@ -492,6 +499,10 @@ _CATEGORY_BY_DISTANCE = {
 }
 
 # "Categoria" (franja etaria) del formulario -> subcategory del modelo Runner.
+# "master_b" NO aparece acá: nadie la elige en el formulario (la franja
+# "Máster" del form sigue siendo una sola opción, 51+). Se deriva más
+# abajo, por edad, a partir de la fecha de nacimiento — ver
+# MASTER_B_MIN_AGE.
 _SUBCATEGORY_BY_LABEL = {
     "mayor": "mayor",
     "veterano": "veterano",
@@ -504,12 +515,51 @@ _GENDER_MAP = {
     "masculino": "M",
 }
 
+# Edad mínima (cumplida para el día de la carrera, ver RACE_DATE) a
+# partir de la cual alguien que marcó "Máster" (51+) en el formulario
+# pasa a la subcategoría "master_b" en vez de quedarse en "master".
+MASTER_B_MIN_AGE = 61
+
 
 def _match_by_prefix(normalized_value: str, mapping: dict) -> Optional[str]:
     for key, mapped in mapping.items():
         if normalized_value.startswith(key):
             return mapped
     return None
+
+
+def _parse_birthdate(value) -> Optional[date]:
+    """Normaliza el valor crudo de la columna de fecha de nacimiento a un
+    date. openpyxl con data_only=True suele devolver un datetime/date real
+    cuando la celda tiene formato de fecha; si vino como texto (celda con
+    formato de texto plano), se prueban los formatos más comunes de una
+    fecha ingresada a mano en un formulario. Cualquier otro caso (vacío,
+    formato no reconocido) devuelve None — quien llama decide qué hacer
+    con la ausencia."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _age_on(birthdate: date, on_date: date) -> int:
+    years = on_date.year - birthdate.year
+    if (on_date.month, on_date.day) < (birthdate.month, birthdate.day):
+        years -= 1
+    return years
 
 
 def parse_runners_xlsx(file_bytes: bytes):
@@ -551,6 +601,15 @@ def parse_runners_xlsx(file_bytes: bytes):
     # arriba, es opcional: si no está, shirt_size simplemente queda vacío
     # en vez de descartar la fila.
     talla_header = next((h for h in column_index if "talla" in h), None)
+
+    # Misma idea para la fecha de nacimiento ("Fecha Nacimiento" en el
+    # form actual). Solo se usa para reclasificar Máster -> Máster B (ver
+    # más abajo), así que si la columna no está en el archivo ningún
+    # Máster puede evaluarse por edad y todos quedan pendientes de
+    # revisión manual (ver skip() en ese bloque).
+    fecha_nacimiento_header = next(
+        (h for h in column_index if "fecha" in h and "nacimiento" in h), None
+    )
 
     runners = []
     skipped = []
@@ -621,6 +680,27 @@ def parse_runners_xlsx(file_bytes: bytes):
             if subcategory is None:
                 skip(f"Categoría no reconocida: {cell(row, 'categoria')!r}", runner_id)
                 continue
+
+            # "Máster" (51+) se reparte en dos podios reales según edad:
+            # 61+ pasa a "master_b", el resto se queda en "master" tal
+            # cual. Sin fecha de nacimiento válida no hay forma de saber
+            # a cuál corresponde, así que la fila se omite en vez de
+            # asumir un lado — queda en "skipped" como aviso para cargar
+            # esa fecha a mano y volver a subir el archivo.
+            if subcategory == "master":
+                birthdate_raw = (
+                    cell(row, fecha_nacimiento_header) if fecha_nacimiento_header else None
+                )
+                birthdate = _parse_birthdate(birthdate_raw)
+                if birthdate is None:
+                    skip(
+                        f"Máster sin fecha de nacimiento válida ({birthdate_raw!r}): "
+                        "no se puede determinar si pasa a Máster B",
+                        runner_id,
+                    )
+                    continue
+                if _age_on(birthdate, RACE_DATE) >= MASTER_B_MIN_AGE:
+                    subcategory = "master_b"
 
         talla_raw = cell(row, talla_header) if talla_header else None
         shirt_size = str(talla_raw).strip().upper() if talla_raw not in (None, "") else None
