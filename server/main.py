@@ -1190,3 +1190,80 @@ async def public_search(
 
     matches = [await _build_public_result(request, runner) for runner in runners]
     return {"query": query, "count": len(matches), "matches": matches}
+
+
+_CATEGORY_QUERY_MAP = {"5k": "5K", "10k": "10K"}
+MAX_LEADERBOARD_RESULTS = 500  # tope defensivo, muy por encima del tamaño real de la carrera
+
+
+@app.get("/public/leaderboard")
+async def public_leaderboard(
+    category: str,
+    request: Request,
+    subcategory: Optional[str] = None,
+    gender: Optional[str] = None,
+    _: None = Depends(enforce_public_rate_limit),
+):
+    """Listado público de resultados, filtrable por distancia (5K/10K),
+    subcategoría (solo 10K) y género -- la versión navegable del podio y
+    de la pestaña Resultados del administrador, pero para el portal
+    público (resultados/). Comparte el rate limit de /public/search.
+
+    A diferencia de /public/search (que nunca devuelve más que unas
+    pocas coincidencias), acá sí se devuelve la tabla completa de una
+    modalidad -- pero ese dato ya es público hoy de todos modos
+    (podio/administrador/cliente llaman a GET /results sin auth, con
+    CORS abierto), así que no hay nada nuevo que exponer; el rate limit
+    sigue existiendo para que esta ruta no se use para golpear Mongo en
+    loop."""
+    normalized_category = _normalize_text(category)
+    if normalized_category not in _CATEGORY_QUERY_MAP:
+        raise HTTPException(status_code=400, detail="category debe ser '5k' o '10k'.")
+
+    query = {
+        "category": _CATEGORY_QUERY_MAP[normalized_category],
+        "elapsed_seconds": {"$ne": None},
+    }
+
+    normalized_subcategory = None
+    if subcategory:
+        normalized_subcategory = _normalize_text(subcategory)
+        if normalized_subcategory not in _SUBCATEGORY_LABELS:
+            raise HTTPException(status_code=400, detail="subcategory inválida.")
+        query["subcategory"] = normalized_subcategory
+
+    normalized_gender = None
+    if gender:
+        normalized_gender = gender.strip().upper()
+        if normalized_gender not in _GENDER_LABELS:
+            raise HTTPException(status_code=400, detail="gender debe ser 'M' o 'F'.")
+        query["gender"] = normalized_gender
+
+    db = request.app.mongodb
+    cursor = (
+        db["results"]
+        .find(query)
+        .sort("elapsed_seconds", 1)
+        .limit(MAX_LEADERBOARD_RESULTS)
+    )
+    docs = await cursor.to_list(length=MAX_LEADERBOARD_RESULTS)
+
+    results = [
+        {
+            "rank": i + 1,
+            "runner_id": doc["runner_id"],
+            "name": doc["name"],
+            "category_label": _format_category_label(doc),
+            "elapsed_seconds": doc.get("elapsed_seconds"),
+            "elapsed_display": doc.get("elapsed_display"),
+        }
+        for i, doc in enumerate(docs)
+    ]
+
+    return {
+        "category": _CATEGORY_QUERY_MAP[normalized_category],
+        "subcategory": normalized_subcategory,
+        "gender": normalized_gender,
+        "count": len(results),
+        "results": results,
+    }
