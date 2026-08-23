@@ -1,4 +1,13 @@
-from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import redis.asyncio as redis
@@ -1002,3 +1011,178 @@ async def delete_result_time(runner_id: str, request: Request):
     )
 
     return {"status": "ok", "runner_id": runner_id}
+
+
+# ============================================================
+# Portal público de resultados (app "resultados", únicamente desplegada
+# en Azure Static Web Apps) — a diferencia de cliente/administrador/podio,
+# el navegador de quien lo visita le pega directo a este backend por el
+# Tailscale Funnel usado como BACKEND_URL en su build, sin pasar por el
+# Nginx del NAS. Es la única superficie de este servidor pensada para
+# ser alcanzada desde cualquier IP de internet, así que las rutas de
+# acá abajo llevan su propio rate limit y nunca devuelven el padrón
+# completo, solo lo que matchea la búsqueda de quien pregunta.
+# ============================================================
+
+PUBLIC_SEARCH_RATE_LIMIT = 20  # búsquedas...
+PUBLIC_SEARCH_RATE_WINDOW_SECONDS = 60  # ...por IP, por minuto
+MIN_SEARCH_QUERY_LENGTH = 2
+MAX_SEARCH_MATCHES = 8  # tope de coincidencias por nombre, nunca el padrón entero
+
+_SUBCATEGORY_LABELS = {
+    "veterano": "Veterano",
+    "mayor": "Mayor",
+    "master": "Master",
+    "master_b": "Máster B",
+}
+_GENDER_LABELS = {"M": "Hombres", "F": "Mujeres"}
+
+
+async def enforce_public_rate_limit(request: Request):
+    """Límite fijo por IP y por ventana de tiempo, guardado en Redis (ya
+    conectado para pub/sub, se reusa el mismo cliente). Deliberadamente
+    simple -- sin sumar una dependencia como slowapi -- porque es un solo
+    endpoint el que lo necesita: un contador que expira solo al cabo de
+    la ventana, incrementado en cada llamada."""
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    key = f"ratelimit:public_search:{client_ip}"
+    redis_client = request.app.redis_client
+    current = await redis_client.incr(key)
+    if current == 1:
+        await redis_client.expire(key, PUBLIC_SEARCH_RATE_WINDOW_SECONDS)
+    if current > PUBLIC_SEARCH_RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail="Demasiadas búsquedas seguidas. Esperá un minuto e intentá de nuevo.",
+        )
+
+
+def _format_category_label(runner: dict) -> str:
+    """Mismo criterio que formatCategoryLabel en category.js (frontend):
+    '10K' se desglosa por subcategoría/género, '5K' no (no tiene podio)."""
+    category = (runner.get("category") or "").upper()
+    if not category:
+        return "—"
+    if _normalize_text(runner.get("category")) != "10k":
+        return category
+
+    parts = [
+        _SUBCATEGORY_LABELS.get(_normalize_text(runner.get("subcategory"))),
+        _GENDER_LABELS.get((runner.get("gender") or "").upper()),
+    ]
+    parts = [p for p in parts if p]
+    return f"{category} · {' · '.join(parts)}" if parts else category
+
+
+async def _rank_within(db, query: dict, elapsed_seconds: float) -> tuple[int, int]:
+    """Puesto (1-based) y total de finishers dentro de `query`, ordenando
+    por elapsed_seconds ascendente -- mismo criterio de orden que usa
+    PodiumBoard.jsx en el frontend, solo que acá corre sobre el grupo
+    entero en vez de limitarse al top 3."""
+    total = await db["results"].count_documents(query)
+    better = await db["results"].count_documents(
+        {**query, "elapsed_seconds": {"$lt": elapsed_seconds}}
+    )
+    return better + 1, total
+
+
+async def _build_public_result(request: Request, runner: dict) -> dict:
+    """Da forma a lo que /public/search expone de un corredor: nunca el
+    documento crudo de Mongo, solo estos campos, más dos puestos posibles:
+
+    - rank_gender / group_total_gender: puesto "general" dentro de su
+      categoría (5K o 10K) contando solo por género, sin mirar
+      subcategoría. Aplica a ambas distancias.
+    - rank_group / group_total_group: puesto dentro de su grupo
+      subcategoría × género -- solo tiene sentido en el 10K (las 8
+      modalidades premiadas, ver PODIUM_GROUPS en category.js); el 5K es
+      recreativo y no tiene subcategorías, así que acá queda null."""
+    db = request.app.mongodb
+    result = await db["results"].find_one({"runner_id": runner["runner_id"]})
+
+    finished = result is not None and result.get("timestamp") is not None
+    elapsed_seconds = result.get("elapsed_seconds") if result else None
+    elapsed_display = result.get("elapsed_display") if result else None
+
+    rank_gender = None
+    group_total_gender = None
+    rank_group = None
+    group_total_group = None
+
+    if finished and elapsed_seconds is not None:
+        gender_query = {
+            "category": runner.get("category"),
+            "gender": runner.get("gender"),
+            "elapsed_seconds": {"$ne": None},
+        }
+        rank_gender, group_total_gender = await _rank_within(
+            db, gender_query, elapsed_seconds
+        )
+
+        if _normalize_text(runner.get("category")) == "10k":
+            group_query = {**gender_query, "subcategory": runner.get("subcategory")}
+            rank_group, group_total_group = await _rank_within(
+                db, group_query, elapsed_seconds
+            )
+
+    return {
+        "runner_id": runner["runner_id"],
+        "name": runner["name"],
+        "category": runner.get("category"),
+        "subcategory": runner.get("subcategory"),
+        "gender": runner.get("gender"),
+        "category_label": _format_category_label(runner),
+        "finished": finished,
+        "elapsed_seconds": elapsed_seconds,
+        "elapsed_display": elapsed_display,
+        "rank_gender": rank_gender,
+        "group_total_gender": group_total_gender,
+        "rank_group": rank_group,
+        "group_total_group": group_total_group,
+    }
+
+
+@app.get("/public/search")
+async def public_search(
+    q: str,
+    request: Request,
+    _: None = Depends(enforce_public_rate_limit),
+):
+    """Búsqueda de solo lectura para el portal público (resultados/), por
+    número de dorsal (match exacto de runner_id) o por nombre (parcial,
+    sin distinguir may/min ni acentos). Deliberadamente NO reusa
+    GET /runners + GET /results como hace podio -- traer el padrón
+    completo al navegador está bien para una pantalla en la LAN, pero
+    dejaría scrapear los datos de todos los corredores a cualquiera en
+    internet. Acá solo se devuelve lo que matchea la búsqueda."""
+    query = q.strip()
+    if len(query) < MIN_SEARCH_QUERY_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Escribí al menos {MIN_SEARCH_QUERY_LENGTH} caracteres.",
+        )
+
+    db = request.app.mongodb
+
+    if query.isdigit():
+        runners = await db["runners"].find({"runner_id": query}).to_list(length=1)
+    else:
+        normalized_query = _normalize_text(query)
+        # Sin índice de texto con plegado de acentos configurado: el
+        # padrón es de a lo sumo unos cientos de corredores, así que se
+        # trae solo los campos que hacen falta para filtrar en memoria
+        # en vez de sumar un índice/config extra para un dataset tan
+        # chico.
+        candidates = await db["runners"].find(
+            {},
+            {"runner_id": 1, "name": 1, "category": 1, "subcategory": 1, "gender": 1},
+        ).to_list(length=None)
+        runners = [
+            r for r in candidates if normalized_query in _normalize_text(r.get("name"))
+        ][:MAX_SEARCH_MATCHES]
+
+    matches = [await _build_public_result(request, runner) for runner in runners]
+    return {"query": query, "count": len(matches), "matches": matches}
