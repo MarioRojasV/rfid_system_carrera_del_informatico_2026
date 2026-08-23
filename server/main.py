@@ -1159,7 +1159,11 @@ async def public_search(
     dejaría scrapear los datos de todos los corredores a cualquiera en
     internet. Acá solo se devuelve lo que matchea la búsqueda."""
     query = q.strip()
-    if len(query) < MIN_SEARCH_QUERY_LENGTH:
+    # El mínimo de caracteres es para no escanear el padrón entero por
+    # nombre con una sola letra -- no aplica a la búsqueda por dorsal
+    # (match exacto), donde un dorsal de un solo dígito ("1", "2", ...)
+    # es válido y no debe rechazarse.
+    if not query.isdigit() and len(query) < MIN_SEARCH_QUERY_LENGTH:
         raise HTTPException(
             status_code=400,
             detail=f"Escribí al menos {MIN_SEARCH_QUERY_LENGTH} caracteres.",
