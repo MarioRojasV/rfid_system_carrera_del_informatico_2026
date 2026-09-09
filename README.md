@@ -122,6 +122,9 @@ docker network create rfid-net   # una sola vez, si no existe ya
 | `GET` | `/runners` | Lista de corredores |
 | `PUT` | `/runners/{runner_id}` | Actualiza un corredor (documento completo, no un parche) |
 | `PUT`/`DELETE` | `/results/{runner_id}/time` | Corrige/borra el tiempo final de un corredor puntual |
+| `GET` | `/reports/summary` | Agregados de corredores/resultados (por categoría, género, subcategoría, camisetas, kits, tags, notas especiales, ausentes, tiempos, calidad de resultados, podio) — filtros: `category`, `subcategory`, `gender` |
+| `GET` | `/reports/export.xlsx` | El mismo informe, como libro de Excel (hojas Resumen/Podio/Corredores/Resultados/Ausentes/Notas especiales) |
+| `GET` | `/reports/export.pdf` | El mismo informe, como reporte PDF listo para imprimir |
 
 ### Reemplazo de corredores desde `.xlsx`
 
