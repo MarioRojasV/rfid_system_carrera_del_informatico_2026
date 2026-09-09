@@ -16,6 +16,7 @@ python-dotenv==1.2.2
 python-multipart==0.0.20
 PyYAML==6.0.3
 redis==8.1.0
+reportlab==4.4.10
 starlette==1.6.0
 typing-inspection==0.4.2
 typing_extensions==4.16.0

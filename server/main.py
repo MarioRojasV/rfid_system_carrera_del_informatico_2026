@@ -1,5 +1,6 @@
 from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 import redis.asyncio as redis
 from contextlib import asynccontextmanager
@@ -13,6 +14,8 @@ import io
 import unicodedata
 import openpyxl
 from dotenv import load_dotenv
+
+from reports import build_report_data, render_report_xlsx, render_report_pdf
 
 load_dotenv()
 
@@ -1002,3 +1005,88 @@ async def delete_result_time(runner_id: str, request: Request):
     )
 
     return {"status": "ok", "runner_id": runner_id}
+
+
+async def _fetch_report_data(
+    db,
+    category: Optional[str],
+    subcategory: Optional[str],
+    gender: Optional[str],
+):
+    """Trae runners y results ya filtrados (mismos filtros que /results),
+    listos para build_report_data. Proyecta _id fuera en vez de
+    convertirlo a string después: los tres consumidores (summary JSON,
+    xlsx, pdf) no necesitan el ObjectId para nada."""
+    query = {}
+    if category is not None:
+        query["category"] = category
+    if subcategory is not None:
+        query["subcategory"] = subcategory
+    if gender is not None:
+        query["gender"] = gender
+
+    runners = await db["runners"].find(query, {"_id": 0}).to_list(length=None)
+    results = await db["results"].find(query, {"_id": 0}).to_list(length=None)
+    return runners, results
+
+
+@app.get("/reports/summary")
+async def get_report_summary(
+    request: Request,
+    category: Optional[str] = None,
+    subcategory: Optional[str] = None,
+    gender: Optional[str] = None,
+):
+    """Agregados de corredores/resultados (por categoría, género, talla
+    de camiseta, entregas, calidad de los tiempos, podio, ausentes,
+    notas especiales) para la pestaña "Informes" del admin. Ver
+    reports.build_report_data para el detalle de cada campo."""
+    runners, results = await _fetch_report_data(
+        request.app.mongodb, category, subcategory, gender
+    )
+    data = build_report_data(runners, results)
+    data["generated_at"] = now_cr().isoformat()
+    return data
+
+
+@app.get("/reports/export.xlsx")
+async def export_report_xlsx(
+    request: Request,
+    category: Optional[str] = None,
+    subcategory: Optional[str] = None,
+    gender: Optional[str] = None,
+):
+    runners, results = await _fetch_report_data(
+        request.app.mongodb, category, subcategory, gender
+    )
+    data = build_report_data(runners, results)
+    content = render_report_xlsx(data, runners, results)
+
+    filename = f"informe_carrera_{now_cr().strftime('%Y%m%d_%H%M')}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/reports/export.pdf")
+async def export_report_pdf(
+    request: Request,
+    category: Optional[str] = None,
+    subcategory: Optional[str] = None,
+    gender: Optional[str] = None,
+):
+    runners, results = await _fetch_report_data(
+        request.app.mongodb, category, subcategory, gender
+    )
+    data = build_report_data(runners, results)
+    generated_at = now_cr()
+    content = render_report_pdf(data, generated_at.strftime("%d/%m/%Y %H:%M"))
+
+    filename = f"informe_carrera_{generated_at.strftime('%Y%m%d_%H%M')}.pdf"
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
